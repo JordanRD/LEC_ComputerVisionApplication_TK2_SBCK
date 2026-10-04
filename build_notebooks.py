@@ -125,7 +125,7 @@ Algoritma mengelola:
         self.objects[self.next_object_id] = centroid
         self.disappeared[self.next_object_id] = 0
         self.bboxes[self.next_object_id] = bbox
-        self.trajectories[self.next_object_id] = [centroid]
+        self.trajectories[self.next_object_id] = [(int(centroid[0]), int(centroid[1]))]
         self.next_object_id += 1
 
     def deregister(self, object_id):
@@ -177,7 +177,7 @@ Algoritma mengelola:
                 self.objects[object_id] = input_centroids[col]
                 self.bboxes[object_id] = rects[col]
                 self.disappeared[object_id] = 0
-                self.trajectories[object_id].append(tuple(input_centroids[col]))
+                self.trajectories[object_id].append((int(input_centroids[col][0]), int(input_centroids[col][1])))
 
                 used_rows.add(row)
                 used_cols.add(col)
@@ -196,7 +196,35 @@ Algoritma mengelola:
 
         return self.objects, self.bboxes, self.trajectories
 
-print("CentroidTracker class berhasil didefinisikan.")
+def merge_nearby_boxes(rects, pad=10):
+    \"\"\"
+    Menggabungkan bounding box yang saling tumpang tindih / berjarak < pad piksel.
+    Satu kendaraan sering tersegmentasi menjadi beberapa blob (kaca, roda, bodi),
+    sehingga tanpa penggabungan satu objek akan mendapat beberapa ID sekaligus.
+    \"\"\"
+    rects = [list(r) for r in rects]
+    changed = True
+    while changed:
+        changed = False
+        merged = []
+        while rects:
+            x, y, w, h = rects.pop()
+            i = 0
+            while i < len(rects):
+                a, b, c, d = rects[i]
+                if x - pad < a + c and a - pad < x + w and y - pad < b + d and b - pad < y + h:
+                    nx, ny = min(x, a), min(y, b)
+                    w, h = max(x + w, a + c) - nx, max(y + h, b + d) - ny
+                    x, y = nx, ny
+                    rects.pop(i)
+                    changed = True
+                else:
+                    i += 1
+            merged.append([x, y, w, h])
+        rects = merged
+    return [tuple(r) for r in rects]
+
+print("CentroidTracker class & merge_nearby_boxes berhasil didefinisikan.")
 """))
 
     # Markdown: Segmentation & Processing Pipeline
@@ -213,7 +241,9 @@ Pada tahap ini, kita menerapkan:
    - **Morphological Opening** ($3\times 3$ kernel) untuk mereduksi bintik derau.
    - **Morphological Closing & Dilation** ($7\times 7$ kernel) untuk menutup lubang (*holes*) pada interior kendaraan dan menyatukan bagian kendaraan yang terfragmentasi.
 4. **Ekstraksi Kontur Wilayah Bergerak**:
-   - Filter luas kontur minimum $450\text{ px}^2$ dan rasio aspek untuk membuang false positive."""))
+   - Filter luas kontur minimum $450\text{ px}^2$ untuk membuang false positive.
+   - **Penggabungan blob berdekatan** (`merge_nearby_boxes`, jarak < 10 px): satu kendaraan sering terpecah menjadi beberapa blob (kaca, roda, bodi). Tanpa langkah ini satu mobil mendapat beberapa ID sekaligus; pada video Rouen jumlah ID unik turun dari 210 menjadi 75.
+   - Filter rasio aspek $0.2 < w/h < 5$."""))
 
     # Cell: Video Processing Loop & Frame Saving
     cells.append(nbf.v4.new_code_cell("""# Inisialisasi MOG2 Subtractor
@@ -266,16 +296,13 @@ while cap.isOpened():
 
     # 5. Ekstraksi Kontur & Wilayah Bergerak
     contours, _ = cv2.findContours(fg_mask_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    rects = []
-    
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area >= min_contour_area:
-            x, y, w, h = cv2.boundingRect(cnt)
-            # Filter rasio aspek
-            aspect_ratio = float(w) / h
-            if 0.2 < aspect_ratio < 5.0:
-                rects.append((x, y, w, h))
+    rects = [cv2.boundingRect(cnt) for cnt in contours if cv2.contourArea(cnt) >= min_contour_area]
+
+    # Gabungkan blob yang berdekatan (satu kendaraan yang terpecah) menjadi satu wilayah
+    rects = merge_nearby_boxes(rects, pad=10)
+
+    # Filter rasio aspek
+    rects = [(x, y, w, h) for (x, y, w, h) in rects if 0.2 < float(w) / h < 5.0]
 
     # 6. Update Tracker
     objects, bboxes, trajectories = tracker.update(rects)
@@ -283,9 +310,9 @@ while cap.isOpened():
     # 7. Render Anotasi pada Frame
     annotated_frame = frame.copy()
     
-    # Render Trajectory Lines
+    # Render Trajectory Lines (hanya untuk objek yang masih aktif)
     for obj_id, pts in trajectories.items():
-        if len(pts) >= 2:
+        if obj_id in objects and len(pts) >= 2:
             for j in range(1, len(pts)):
                 cv2.line(annotated_frame, pts[j - 1], pts[j], (0, 255, 255), 2)
 
@@ -382,7 +409,7 @@ Berikut adalah perbandingan bertahap pada berbagai sampel frame yang memperlihat
    - Fitur `detectShadows=True` pada OpenCV MOG2 sangat krusial karena membedakan bayangan kendaraan (intensitas $127$) dengan badan kendaraan asli (intensitas $255$), sehingga mencegah distorsi bentuk wilayah segmentasi akibat bayangan aspal.
 2. **Peran Operasi Morfologi**:
    - *Opening* menghilangkan derau bintik-bintik acak akibat derau sensor kamera atau getaran daun.
-   - *Closing & Dilation* berhasil menyatukan komponen kendaraan (seperti kaca depan dan kap mesin yang kadang memiliki kontras berbeda dengan latar) menjadi satu *connected component* yang solid.
+   - *Closing & Dilation* menyatukan sebagian besar komponen kendaraan (seperti kaca depan dan kap mesin yang kadang memiliki kontras berbeda dengan latar), namun kendaraan besar yang dekat dengan kamera masih bisa terpecah. Sisa fragmen ini ditangani oleh penggabungan bounding box berdekatan sebelum tahap pelacakan.
 
 #### Analisis Pelacakan Objek Bergerak (Moving Object Tracking):
 1. **Kestabilan ID Pelacakan**:
@@ -885,8 +912,10 @@ def execute_and_save(nb, filename):
     print(f"Successfully executed and saved {filename}")
 
 if __name__ == "__main__":
-    nb2 = create_soal_2()
-    with open("soal_2.ipynb", "w", encoding="utf-8") as f:
-        nbf.write(nb2, f)
-    execute_and_save(nb2, "soal_2.ipynb")
+    import sys
+    # Pilih soal yang dibangun: `python build_notebooks.py 1` atau `2` (default: keduanya)
+    targets = sys.argv[1:] or ["1", "2"]
+    builders = {"1": create_soal_1, "2": create_soal_2}
+    for t in targets:
+        execute_and_save(builders[t](), f"soal_{t}.ipynb")
 
